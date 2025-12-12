@@ -1,143 +1,221 @@
-"use client"
+"use client";
 
-import { useState } from "react"
-import { Card } from "@/components/ui/card"
-import { Button } from "@/components/ui/button"
-import { AlertCircle, Plus, Trash2 } from "lucide-react"
+import { useState } from "react";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { AlertCircle, Plus, Trash2, Zap } from "lucide-react";
+import { useAccount, useChainId } from "wagmi";
+import { writeContract, waitForTransactionReceipt } from "@wagmi/core";
+import { parseEther } from "viem";
+import { config } from "@/wagmi-config"; // adjust path if needed
+import { FX_SWAP_AGENT_ADDRESS } from "@/constants/contracts";
+import { CUSD_ADDRESS, CELO_ADDRESS } from "@/constants/tokens";
 
 interface Trigger {
-  id: string
-  type: "buy" | "sell"
-  price: string
-  amount: string
+  id: string;
+  type: "buy" | "sell"; // buy = cUSD → CELO, sell = CELO → cUSD
+  price: string; // target price in USD (e.g., "0.92")
+  amount: string; // amount in cUSD
+  status: "pending" | "active" | "executed" | "cancelled";
 }
 
+const FXSwapAgentABI = [
+  // Only the function we need
+  {
+    name: "executeFXSwap",
+    type: "function",
+    inputs: [
+      { name: "_user", type: "address" },
+      { name: "_tokenIn", type: "address" },
+      { name: "_tokenOut", type: "address" },
+      { name: "_amountIn", type: "uint256" },
+      { name: "_minAmountOut", type: "uint256" },
+      { name: "_useMento", type: "bool" },
+      { name: "_swapData", type: "bytes" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "nonpayable",
+  },
+] as const;
+
 export function TriggerSetup() {
-  const [triggers, setTriggers] = useState<Trigger[]>([
-    { id: "1", type: "buy", price: "0.90", amount: "100" },
-    { id: "2", type: "sell", price: "0.95", amount: "150" },
-  ])
-  const [newPrice, setNewPrice] = useState("")
-  const [newAmount, setNewAmount] = useState("")
-  const [newType, setNewType] = useState<"buy" | "sell">("buy")
+  const { address, isConnected } = useAccount();
+  const chainId = useChainId();
+
+  const [triggers, setTriggers] = useState<Trigger[]>([]);
+  const [newPrice, setNewPrice] = useState("");
+  const [newAmount, setNewAmount] = useState("");
+  const [newType, setNewType] = useState<"buy" | "sell">("buy");
+  const [isLoading, setIsLoading] = useState(false);
 
   const addTrigger = () => {
-    if (newPrice && newAmount) {
-      setTriggers([...triggers, { id: Date.now().toString(), type: newType, price: newPrice, amount: newAmount }])
-      setNewPrice("")
-      setNewAmount("")
-    }
-  }
+    if (!newPrice || !newAmount || !isConnected) return;
+
+    const trigger: Trigger = {
+      id: Date.now().toString(),
+      type: newType,
+      price: newPrice,
+      amount: newAmount,
+      status: "pending",
+    };
+
+    setTriggers((prev) => [...prev, trigger]);
+    setNewPrice("");
+    setNewAmount("");
+  };
 
   const removeTrigger = (id: string) => {
-    setTriggers(triggers.filter((t) => t.id !== id))
-  }
+    setTriggers((prev) => prev.filter((t) => t.id !== id));
+  };
+
+  // This would be called by your backend/AI agent when price condition is met
+  const executeTrigger = async (trigger: Trigger) => {
+    if (!address || chainId !== 42220 && chainId !== 44787) {
+      alert("Please connect to Celo Mainnet or Alfajores");
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const amountIn = parseEther(trigger.amount);
+      const targetPrice = Number(trigger.price);
+
+      // Calculate minAmountOut based on target price ± slippage tolerance
+      const slippageTolerance = 0.005; // 0.5%
+      const minPrice = trigger.type === "buy"
+        ? targetPrice * (1 - slippageTolerance)
+        : targetPrice * (1 + slippageTolerance);
+
+      const minAmountOut = trigger.type === "buy"
+        ? parseEther((Number(trigger.amount) / minPrice).toFixed(6)) // cUSD → CELO
+        : parseEther((Number(trigger.amount) * minPrice).toFixed(6)); // CELO → cUSD
+
+      const tokenIn = trigger.type === "buy" ? CUSD_ADDRESS : CELO_ADDRESS;
+      const tokenOut = trigger.type === "buy" ? CELO_ADDRESS : CUSD_ADDRESS;
+
+      const hash = await writeContract(config, {
+        address: FX_SWAP_AGENT_ADDRESS,
+        abi: FXSwapAgentABI,
+        functionName: "executeFXSwap",
+        args: [
+          address,           // _user
+          tokenIn,           // _tokenIn
+          tokenOut,          // _tokenOut
+          amountIn,          // _amountIn
+          minAmountOut,      // _minAmountOut
+          true,              // _useMento = true (best rates on Celo)
+          "0x",              // _swapData (empty for Mento v2/v3)
+        ],
+      });
+
+      await waitForTransactionReceipt(config, { hash });
+
+      // Update trigger status locally
+      setTriggers((prev) =>
+        prev.map((t) =>
+          t.id === trigger.id ? { ...t, status: "executed" as const } : t }
+        )
+      );
+
+      alert(`Swap executed successfully! ${trigger.type.toUpperCase()} ${trigger.amount} cUSD @ ~$${trigger.price}`);
+    } catch (error: any) {
+      console.error(error);
+      alert("Swap failed: " + (error.shortMessage || error.message));
+      );
+      setTriggers((prev) =>
+        prev.map((t) =>
+          t.id === trigger.id ? { ...t, status: "pending" } : t }
+        )
+      );
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   return (
     <Card className="border-border bg-card p-4 sm:p-6">
-      <h2 className="mb-4 text-base sm:text-lg font-semibold text-foreground">Set Trigger Prices</h2>
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-base sm:text-lg font-semibold text-foreground">
+          AI-Powered Price Triggers
+        </h2>
+        <Zap className="h-5 w-5 text-yellow-500 animate-pulse" />
+      </div>
 
-      <div className="mb-6 rounded-lg border border-accent/30 bg-accent/5 p-3 sm:p-4 flex gap-3">
-        <AlertCircle className="h-5 w-5 text-accent flex-shrink-0 mt-0.5" />
+      <div className="mb-6 rounded-lg border border-blue-500/20 bg-blue-500/5 p-3 sm:p-4 flex gap-3">
+        <AlertCircle className="h-5 w-5 text-blue-500 flex-shrink-0 mt-0.5" />
         <div className="text-xs sm:text-sm text-foreground">
-          Set buy and sell trigger prices. When the market reaches your target price, the AI agent will automatically
-          execute the trade.
+          Your AI agent monitors cUSD/CELO price 24/7. When your target is hit, it instantly executes via{" "}
+          <span className="font-bold text-blue-400">FXSwapAgent</span> using Mento (best rates).
         </div>
       </div>
 
-      {/* Active Triggers */}
+      {/* Active Triggers List */}
       {triggers.length > 0 && (
-        <div className="mb-6 space-y-2">
+        <div className="mb-6 space-y-3">
+          <h3 className="text-sm font-medium text-muted-foreground">Active Triggers</h3>
           {triggers.map((trigger) => (
             <div
               key={trigger.id}
-              className="flex items-center justify-between rounded-lg border border-border bg-muted/30 p-2 sm:p-3 gap-2 sm:gap-4"
+              className="flex items-center justify-between rounded-lg border border-border bg-muted/30 p-3 sm:p-4"
             >
-              <div className="flex items-center gap-2 sm:gap-4 min-w-0">
+              <div className="flex items-center gap-3">
                 <span
-                  className={`inline-block rounded px-2 py-1 text-xs font-semibold flex-shrink-0 ${
+                  className={`px-3 py-1 rounded text-xs font-bold ${
                     trigger.type === "buy"
-                      ? "bg-green-500/20 text-green-600 dark:text-green-400"
-                      : "bg-red-500/20 text-red-600 dark:text-red-400"
+                      ? "bg-green-500/20 text-green-600"
+                      : "bg-red-500/20 text-red-600"
                   }`}
                 >
                   {trigger.type.toUpperCase()}
                 </span>
-                <div className="text-xs sm:text-sm min-w-0">
-                  <p className="font-mono font-semibold text-foreground">Price: {trigger.price}</p>
-                  <p className="text-xs text-muted-foreground">Amount: {trigger.amount} cUSD</p>
+                <div>
+                  <p className="font-mono text-foreground">
+                    @ ${trigger.price} → {trigger.amount} cUSD
+                  </p>
+                  <p className="text-xs text-muted-foreground capitalize">
+                    Status: {trigger.status}
+                  </p>
                 </div>
               </div>
-              <button
-                onClick={() => removeTrigger(trigger.id)}
-                className="p-1 text-muted-foreground hover:text-destructive transition-colors flex-shrink-0"
-              >
-                <Trash2 className="h-4 w-4" />
-              </button>
+
+              <div className="flex items-center gap-2">
+                {trigger.status === "pending" && (
+                  <button
+                    onClick={() => executeTrigger(trigger)}
+                    disabled={isLoading}
+                    className="text-xs px-3 py-1 bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50"
+                  >
+                    Test Execute
+                  </button>
+                )}
+                <button
+                  onClick={() => removeTrigger(trigger.id)}
+                  className="p-2 text-muted-foreground hover:text-destructive"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
             </div>
           ))}
         </div>
       )}
 
       {/* Add New Trigger */}
-      <div className="space-y-3 sm:space-y-4 rounded-lg border border-border bg-muted/20 p-3 sm:p-4">
-        <h3 className="text-xs sm:text-sm font-semibold text-foreground">Add New Trigger</h3>
+      <div className="rounded-lg border border-border bg-muted/20 p-4">
+        <h3 className="text-sm font-semibold mb-3">Add New Trigger</h3>
 
-        <div className="grid grid-cols-2 gap-2 sm:gap-4">
-          <div>
-            <label className="block text-xs font-medium text-muted-foreground mb-2">Type</label>
-            <select
-              value={newType}
-              onChange={(e) => setNewType(e.target.value as "buy" | "sell")}
-              className="w-full rounded-lg border border-input bg-background px-2 sm:px-3 py-2 text-xs sm:text-sm text-foreground"
-            >
-              <option value="buy">Buy</option>
-              <option value="sell">Sell</option>
-            </select>
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-muted-foreground mb-2">Price</label>
-            <input
-              type="number"
-              placeholder="0.90"
-              step="0.01"
-              value={newPrice}
-              onChange={(e) => setNewPrice(e.target.value)}
-              className="w-full rounded-lg border border-input bg-background px-2 sm:px-3 py-2 text-xs sm:text-sm text-foreground placeholder:text-muted-foreground"
-            />
-          </div>
-        </div>
-
-        <div>
-          <label className="block text-xs font-medium text-muted-foreground mb-2">Amount (cUSD)</label>
-          <input
-            type="number"
-            placeholder="100"
-            step="1"
-            value={newAmount}
-            onChange={(e) => setNewAmount(e.target.value)}
-            className="w-full rounded-lg border border-input bg-background px-2 sm:px-3 py-2 text-xs sm:text-sm text-foreground placeholder:text-muted-foreground"
-          />
-        </div>
-
-        <Button
-          onClick={addTrigger}
-          className="w-full gap-2 bg-accent hover:bg-accent/90 text-xs sm:text-sm py-2 sm:py-3"
-        >
-          <Plus className="h-4 w-4" />
-          Add Trigger
-        </Button>
-      </div>
-
-      {triggers.length > 0 && (
-        <div className="mt-4 sm:mt-6 flex items-center justify-between rounded-lg bg-primary/5 p-3 sm:p-4">
-          <div>
-            <p className="text-xs sm:text-sm font-medium text-foreground">{triggers.length} Trigger(s) Active</p>
-            <p className="text-xs text-muted-foreground">AI agent monitoring in real-time</p>
-          </div>
-          <div className="h-2 w-2 rounded-full bg-green-500 animate-pulse"></div>
-        </div>
-      )}
-    </Card>
-  )
-}
+        {!isConnected ? (
+          <p className="text-sm text-orange-600 text-center py-4">
+            Connect wallet to set triggers
+          </p>
+        ) : (
+          <>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
+              <div>
+                <label className="block text-xs font-medium text-muted-foreground mb-1">Type</label>
+                <select
+                  value={newType}
+                  onChange={(e) => setNewType(e.target.value as "buy" | "sell")}
+                  className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
+                >
+                  <option value="buy">Buy CELO (with c
