@@ -6,21 +6,34 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
-interface IMentoExchange {
-    function exchangeOut(
-        address stableToken,
-        address collateralToken,
-        uint256 stableAmount
+// Updated interface for Mento Broker (current v2, adaptable for v3)
+interface IMentoBroker {
+    function swap(
+        address exchangeProvider,
+        bytes32 exchangeId,
+        address assetIn,
+        address assetOut,
+        uint256 amountIn,
+        uint256 minAmountOut
     ) external returns (uint256);
-    
-    function exchangeIn(
-        address stableToken,
-        address collateralToken,
-        uint256 collateralAmount
-    ) external returns (uint256);
+
+    function getAmountOut(
+        address exchangeProvider,
+        bytes32 exchangeId,
+        address assetIn,
+        address assetOut,
+        uint256 amountIn
+    ) external view returns (uint256);
 }
 
+// Interface for BiPoolManager to get exchangeId (for v2)
+interface IBiPoolManager {
+    function getExchangeId(address asset0, address asset1) external view returns (bytes32);
+}
+
+// Keep Uniswap V4 interface as provided
 interface IUniswapV4Router {
     function swap(
         address tokenIn,
@@ -34,38 +47,42 @@ interface IUniswapV4Router {
 contract FXSwapAgent is Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
-    IMentoExchange public mentoExchange;
+    IMentoBroker public mentoBroker;
+    IBiPoolManager public biPoolManager;
     IUniswapV4Router public uniswapV4Router;
-    
+
+    // For future-proofing: exchange provider address (BiPoolManager for v2, potentially FPMMFactory for v3)
+    address public mentoExchangeProvider;
+
     // Access control: Agent addresses authorized to execute trades
     mapping(address => bool) public authorizedAgents;
-    
+
     // User trading limits and safety parameters
     mapping(address => UserLimits) public userLimits;
     mapping(address => UserStats) public userStats;
-    
+
     // Per-user rate limiting
     mapping(address => uint256) public lastExecutionTime;
     uint256 public constant MIN_EXECUTION_INTERVAL = 5 seconds;
-    
+
     // Slippage and safety parameters
     uint256 public maxSlippagePercentage = 500; // 5% in basis points
     uint256 public maxSingleSwapAmount = 1_000_000e18; // Max 1M stable tokens
-    
+
     struct UserLimits {
         uint256 maxDailyVolume;
         uint256 maxSingleSwapAmount;
         uint256 dailyVolumeUsed;
         uint256 lastResetTime;
     }
-    
+
     struct UserStats {
         uint256 totalSwapsExecuted;
         uint256 totalVolumeTraded;
         uint256 successfulSwaps;
         uint256 failedSwaps;
     }
-    
+
     struct SwapExecution {
         address user;
         address tokenIn;
@@ -76,11 +93,11 @@ contract FXSwapAgent is Ownable, ReentrancyGuard, Pausable {
         bool success;
         uint256 timestamp;
     }
-    
+
     // Audit trail for all executions
     SwapExecution[] public executionHistory;
     mapping(address => uint256[]) public userExecutions;
-    
+
     // Emergency controls
     bool public emergencyPauseEnabled;
     address public emergencyPauseAdmin;
@@ -102,16 +119,20 @@ contract FXSwapAgent is Ownable, ReentrancyGuard, Pausable {
     event EmergencyPause(bool enabled, uint256 timestamp);
 
     constructor(
-        address _mentoExchange,
+        address _mentoBroker,
+        address _biPoolManager,
         address _uniswapV4Router,
         address _emergencyPauseAdmin
     ) Ownable(msg.sender) {
-        require(_mentoExchange != address(0), "Invalid Mento address");
+        require(_mentoBroker != address(0), "Invalid Mento Broker address");
+        require(_biPoolManager != address(0), "Invalid BiPoolManager address");
         require(_uniswapV4Router != address(0), "Invalid Uniswap address");
         require(_emergencyPauseAdmin != address(0), "Invalid admin address");
-        
-        mentoExchange = IMentoExchange(_mentoExchange);
+
+        mentoBroker = IMentoBroker(_mentoBroker);
+        biPoolManager = IBiPoolManager(_biPoolManager);
         uniswapV4Router = IUniswapV4Router(_uniswapV4Router);
+        mentoExchangeProvider = _biPoolManager; // Default to BiPoolManager for v2
         emergencyPauseAdmin = _emergencyPauseAdmin;
     }
 
@@ -133,31 +154,32 @@ contract FXSwapAgent is Ownable, ReentrancyGuard, Pausable {
     ) external onlyOwner {
         require(_user != address(0), "Invalid user");
         require(_maxDailyVolume > 0 && _maxSingleSwapAmount > 0, "Invalid limits");
-        
+
         userLimits[_user] = UserLimits({
             maxDailyVolume: _maxDailyVolume,
             maxSingleSwapAmount: _maxSingleSwapAmount,
             dailyVolumeUsed: 0,
             lastResetTime: block.timestamp
         });
-        
+
         emit UserLimitUpdated(_user, _maxDailyVolume, _maxSingleSwapAmount);
     }
 
+    // Updated executeFXSwap to use Mento v2 Broker, with provisions for v3 (e.g., update exchangeProvider)
     function executeFXSwap(
         address _user,
         address _tokenIn,
         address _tokenOut,
         uint256 _amountIn,
         uint256 _minAmountOut,
-        bool _useMento
+        bool _useMento,
+        bytes calldata _swapData // For Uniswap or potential v3 data
     ) external nonReentrant whenNotPaused returns (uint256 amountOut) {
         require(authorizedAgents[msg.sender], "Unauthorized agent");
         require(_user != address(0), "Invalid user");
         require(!blacklistedUsers[_user], "User blacklisted");
         require(_tokenIn != address(0) && _tokenOut != address(0), "Invalid tokens");
         require(_amountIn > 0, "Invalid amount");
-
         require(
             block.timestamp >= lastExecutionTime[_user] + MIN_EXECUTION_INTERVAL,
             "Execution too frequent"
@@ -168,20 +190,14 @@ contract FXSwapAgent is Ownable, ReentrancyGuard, Pausable {
 
         uint256 balanceBefore = IERC20(_tokenOut).balanceOf(address(this));
 
-        try {
-            if (_useMento) {
-                amountOut = _executeMentoSwap(_tokenIn, _tokenOut, _amountIn);
-            } else {
-                amountOut = _executeUniswapSwap(_tokenIn, _tokenOut, _amountIn);
-            }
+        try this._executeSwap(_user, _tokenIn, _tokenOut, _amountIn, _minAmountOut, _useMento, _swapData) returns (uint256 _amountOut) {
+            amountOut = _amountOut;
         } catch Error(string memory reason) {
             userStats[_user].failedSwaps++;
             emit SwapFailed(_user, reason, block.timestamp);
             revert(reason);
         }
 
-        require(amountOut >= _minAmountOut, "Slippage exceeded");
-        
         uint256 balanceAfter = IERC20(_tokenOut).balanceOf(address(this));
         require(balanceAfter - balanceBefore == amountOut, "Balance mismatch");
 
@@ -206,49 +222,91 @@ contract FXSwapAgent is Ownable, ReentrancyGuard, Pausable {
         userExecutions[_user].push(executionIndex);
 
         emit SwapExecuted(_user, _tokenIn, _tokenOut, _amountIn, amountOut, block.timestamp);
+
+        return amountOut;
+    }
+
+    // Internal wrapper to catch errors
+    function _executeSwap(
+        address /* _user */,
+        address _tokenIn,
+        address _tokenOut,
+        uint256 _amountIn,
+        uint256 _minAmountOut,
+        bool _useMento,
+        bytes calldata _swapData
+    ) external returns (uint256) {
+        require(msg.sender == address(this), "Internal call only");
+
+        uint256 amountOut;
+        if (_useMento) {
+            amountOut = _executeMentoSwap(_tokenIn, _tokenOut, _amountIn, _minAmountOut, _swapData);
+        } else {
+            amountOut = _executeUniswapSwap(_tokenIn, _tokenOut, _amountIn, _minAmountOut, _swapData);
+        }
         return amountOut;
     }
 
     function _executeMentoSwap(
         address _tokenIn,
         address _tokenOut,
-        uint256 _amountIn
+        uint256 _amountIn,
+        uint256 _minAmountOut,
+        bytes calldata /* _swapData */ // Can be used for v3-specific data if needed
     ) internal returns (uint256) {
+        // Compute exchangeId using BiPoolManager (for v2)
+        bytes32 exchangeId = biPoolManager.getExchangeId(_tokenIn, _tokenOut);
+
+        // Optional: Check expected out for additional slippage check
+        uint256 expectedOut = mentoBroker.getAmountOut(mentoExchangeProvider, exchangeId, _tokenIn, _tokenOut, _amountIn);
+        // Adjust maxSlippage if needed
+        uint256 slippageAdjusted = (expectedOut * (10000 - maxSlippagePercentage)) / 10000;
+        if (_minAmountOut < slippageAdjusted) {
+            _minAmountOut = slippageAdjusted;
+        }
+
         IERC20(_tokenIn).safeTransferFrom(msg.sender, address(this), _amountIn);
-        IERC20(_tokenIn).safeApprove(address(mentoExchange), _amountIn);
-        
-        uint256 amountOut = mentoExchange.exchangeOut(_tokenOut, _tokenIn, _amountIn);
+        IERC20(_tokenIn).safeApprove(address(mentoBroker), _amountIn);
+
+        uint256 amountOut = mentoBroker.swap(mentoExchangeProvider, exchangeId, _tokenIn, _tokenOut, _amountIn, _minAmountOut);
+
         return amountOut;
     }
 
     function _executeUniswapSwap(
         address _tokenIn,
         address _tokenOut,
-        uint256 _amountIn
+        uint256 _amountIn,
+        uint256 _minAmountOut,
+        bytes calldata _swapData
     ) internal returns (uint256) {
         IERC20(_tokenIn).safeTransferFrom(msg.sender, address(this), _amountIn);
         IERC20(_tokenIn).safeApprove(address(uniswapV4Router), _amountIn);
-        
-        uint256 minAmountOut = (_amountIn * (10000 - maxSlippagePercentage)) / 10000;
-        uint256 amountOut = uniswapV4Router.swap(_tokenIn, _tokenOut, _amountIn, minAmountOut, "");
-        
+
+        // Use provided minAmountOut or calculate
+        if (_minAmountOut == 0) {
+            _minAmountOut = (_amountIn * (10000 - maxSlippagePercentage)) / 10000;
+        }
+        uint256 amountOut = uniswapV4Router.swap(_tokenIn, _tokenOut, _amountIn, _minAmountOut, _swapData);
+
         return amountOut;
     }
 
     function _validateUserLimits(address _user, uint256 _amount) internal {
         UserLimits storage limits = userLimits[_user];
-        
+
         // Reset daily volume if new day
         if (block.timestamp >= limits.lastResetTime + 1 days) {
             limits.dailyVolumeUsed = 0;
             limits.lastResetTime = block.timestamp;
         }
-        
+
         require(_amount <= limits.maxSingleSwapAmount, "Single swap exceeds limit");
         require(
             limits.dailyVolumeUsed + _amount <= limits.maxDailyVolume,
             "Daily volume limit exceeded"
         );
+        require(_amount <= maxSingleSwapAmount, "Global single swap limit exceeded");
     }
 
     function blacklistUser(address _user, bool _status) external onlyOwner {
@@ -267,17 +325,17 @@ contract FXSwapAgent is Ownable, ReentrancyGuard, Pausable {
         emit EmergencyPause(_paused, block.timestamp);
     }
 
-    function getExecutionHistory(uint256 _limit, uint256 _offset) 
-        external 
-        view 
-        returns (SwapExecution[] memory) 
+    function getExecutionHistory(uint256 _limit, uint256 _offset)
+        external
+        view
+        returns (SwapExecution[] memory)
     {
         require(_limit <= 100, "Limit too high");
         uint256 end = _offset + _limit;
         if (end > executionHistory.length) {
             end = executionHistory.length;
         }
-        
+
         SwapExecution[] memory history = new SwapExecution[](end - _offset);
         for (uint256 i = 0; i < end - _offset; i++) {
             history[i] = executionHistory[_offset + i];
@@ -285,10 +343,10 @@ contract FXSwapAgent is Ownable, ReentrancyGuard, Pausable {
         return history;
     }
 
-    function getUserExecutionCount(address _user) 
-        external 
-        view 
-        returns (uint256) 
+    function getUserExecutionCount(address _user)
+        external
+        view
+        returns (uint256)
     {
         return userExecutions[_user].length;
     }
@@ -297,4 +355,12 @@ contract FXSwapAgent is Ownable, ReentrancyGuard, Pausable {
         require(_slippageBps <= 1000, "Slippage too high"); // Max 10%
         maxSlippagePercentage = _slippageBps;
     }
+
+    // Additional function for future updates (e.g., to FPMM for Mento v3)
+    function setMentoExchangeProvider(address _newProvider) external onlyOwner {
+        require(_newProvider != address(0), "Invalid provider");
+        mentoExchangeProvider = _newProvider;
+    }
+
+    // For ZK transition: No specific changes needed as Celo's ZK L2 is EVM-compatible, but monitor for any gas optimizations or ZK-specific features in future.
 }
