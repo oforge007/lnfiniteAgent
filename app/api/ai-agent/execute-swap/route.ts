@@ -1,116 +1,58 @@
-import { type NextRequest, NextResponse } from "next/server"
-import { ethers } from "ethers"
-import { keyManager } from "@/lib/key-manager"
-import { rateLimiter } from "@/lib/rate-limiter"
+// Add to imports
+import { Mento } from "@mento-protocol/mento-sdk"
 
-// Initialize contract interface
-const FX_SWAP_ABI = [
-  "function executeFXSwap(address user, address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut, bool useMento) public returns (uint256)",
-  "function userStats(address) public view returns (uint256, uint256, uint256, uint256)",
-  "function userLimits(address) public view returns (uint256, uint256, uint256, uint256)",
-]
+// In POST handler, after signer init and before custom contract call:
+if (body.useMento) {
+  // Mento SDK Integration
+  const mento = await Mento.create(signer)
 
-interface SwapRequest {
-  userId: string
-  agentId: string
-  tokenIn: string
-  tokenOut: string
-  amountIn: string
-  minAmountOut: string
-  useMento: boolean
-  signature: string // Pre-signed by AI agent
-}
-
-function validateRequestSignature(request: SwapRequest, publicKey: string): boolean {
-  try {
-    const message = ethers.solidityPacked(
-      ["address", "address", "address", "uint256", "uint256", "bool"],
-      [request.userId, request.tokenIn, request.tokenOut, request.amountIn, request.minAmountOut, request.useMento],
-    )
-
-    const recovered = ethers.verifyMessage(message, request.signature)
-    return recovered === publicKey
-  } catch {
-    return false
+  // Validate tokens are Mento stables (optional whitelist check)
+  const validStables = [
+    "0x765DE816845861e75A25fCA122bb6898b8B1282a", // cUSD
+    "0xD8763CBa276a3738E6DE85b4b3bF3750aDC6301", // cEUR
+    "0xe8537a3d056DA446677B9E9d6c5dB704EaAb4787", // cREAL
+  ]
+  if (!validStables.includes(body.tokenIn) || !validStables.includes(body.tokenOut)) {
+    return NextResponse.json({ error: "Invalid Mento stable tokens" }, { status: 400 })
   }
-}
 
-export async function POST(request: NextRequest) {
-  try {
-    // Rate limit check
-    const body: SwapRequest = await request.json()
+  const amountIn = BigInt(body.amountIn)
+  const minAmountOut = BigInt(body.minAmountOut)
 
-    if (!rateLimiter.isAllowed(body.userId, "swap")) {
-      return NextResponse.json({ error: "Rate limit exceeded" }, { status: 429 })
-    }
-
-    // Validate request signature
-    let agentPublicKey: string
-    try {
-      const keyStore = await keyManager.getAgentKey(body.agentId)
-      // In production, derive public key from stored key
-      agentPublicKey = keyStore
-    } catch {
-      return NextResponse.json({ error: "Invalid agent" }, { status: 401 })
-    }
-
-    if (!validateRequestSignature(body, agentPublicKey)) {
-      return NextResponse.json({ error: "Invalid signature" }, { status: 401 })
-    }
-
-    // Validate transaction permissions
-    const contractAddress = process.env.FX_SWAP_CONTRACT!
-    const functionSelector = "executeFXSwap"
-
-    const isPermitted = await keyManager.validateTransaction(
-      body.agentId,
-      contractAddress,
-      functionSelector,
-      BigInt(body.amountIn),
-    )
-
-    if (!isPermitted) {
-      return NextResponse.json({ error: "Transaction exceeds permitted limits" }, { status: 403 })
-    }
-
-    // Initialize provider and signer
-    const provider = new ethers.JsonRpcProvider(process.env.CELO_RPC_URL)
-    const privateKey = await keyManager.getAgentKey(body.agentId)
-    const signer = new ethers.Wallet(privateKey, provider)
-
-    // Create contract instance
-    const contract = new ethers.Contract(contractAddress, FX_SWAP_ABI, signer)
-
-    const tx = await contract.executeFXSwap(
-      body.userId,
-      body.tokenIn,
-      body.tokenOut,
-      body.amountIn,
-      body.minAmountOut,
-      body.useMento,
-      {
-        gasLimit: 500000,
-        gasPrice: await provider.getGasPrice(),
-      },
-    )
-
-    const receipt = await tx.wait()
-
-    return NextResponse.json({
-      success: true,
-      transactionHash: receipt?.hash,
-      blockNumber: receipt?.blockNumber,
-      gasUsed: receipt?.gasUsed.toString(),
-    })
-  } catch (error) {
-    console.error("[v0] Swap execution error:", error)
-
-    return NextResponse.json(
-      {
-        error: "Swap execution failed",
-        details: error instanceof Error ? error.message : "Unknown error",
-      },
-      { status: 500 },
-    )
+  // Get quote for slippage check
+  const quoteAmountOut = await mento.getAmountOut(body.tokenIn, body.tokenOut, amountIn)
+  if (quoteAmountOut < minAmountOut) {
+    return NextResponse.json({ error: "Quote below minAmountOut (slippage too high)" }, { status: 400 })
   }
+
+  // Approve Broker to spend tokenIn (idempotent if already approved)
+  const approveTx = await mento.increaseAllowance(body.tokenIn, amountIn)
+  if (approveTx) {
+    const approveReceipt = await signer.sendTransaction(approveTx)
+    await approveReceipt.wait()
+  }
+
+  // Execute swap
+  const swapTxRequest = await mento.swapOut(
+    body.tokenIn,
+    body.tokenOut,
+    minAmountOut, // Use request's min for protection
+    amountIn
+  )
+  const tx = await signer.sendTransaction(swapTxRequest)
+  const receipt = await tx.wait()
+
+  // Log userId for tracking (e.g., emit event or store)
+  console.log(`Swap executed for user ${body.userId} via agent ${body.agentId}`)
+
+  return NextResponse.json({
+    success: true,
+    transactionHash: receipt.hash,
+    blockNumber: receipt.blockNumber,
+    gasUsed: receipt.gasUsed?.toString(),
+    quoteAmountOut: quoteAmountOut.toString(), // Bonus: return quote
+  })
+} else {
+  // Fallback to custom contract (your original logic, with BigInt fixes)
+  // ... (contract call as in patched code above)
 }
